@@ -2,8 +2,8 @@
 ## Computer Vision 2026-2027 - NOVA FCT
 ## Project Stage 1 - Shot boundary detection and recurring scenes
 ##
-## Student 1 (number)
-## Student 2 (number)
+## Tomás Alexandre (73213)
+## Ana Francisco (77580)
 ##
 ###############################################################################
 
@@ -13,6 +13,7 @@ import os
 
 import cv2
 import numpy as np
+from typing import List, Tuple, Optional
 
 import grouping   # group_shots: union-find grouping of shots (Part 3, Task 7)
 import metrics
@@ -63,3 +64,35 @@ if __name__ == "__main__":
     test = [results[n] for n in sorted(results) if n.startswith("test")]
     metrics.print_table([(n, results[n]) for n in sorted(results)]
                         + [("DEV", metrics.sum_counts(dev)), ("TEST", metrics.sum_counts(test))])
+
+
+#Reads video frame by frame and downsclaes it. Returns list of frames and total frames.
+def load_and_preprocess_frames(
+    video_path: str, 
+    target_size: Optional[Tuple[int, int]] = (320, 180)) -> Tuple[List[np.ndarray], int]:
+  
+    cap = cv2.VideoCapture(video_path)
+    
+    if not cap.isOpened():
+        raise FileNotFoundError(f"Error on path to video {video_path}")
+        
+    frames = []
+    
+    while True:
+        ret, frame = cap.read()
+        if not ret:
+            break
+            
+        # Redimensiona a frame para (320, 180) se especificado
+        if target_size is not None:
+            frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
+            
+        frames.append(frame)
+        
+    cap.release()
+    
+    total_frames = len(frames)
+    if total_frames == 0:
+        raise ValueError(f"Video {video_path} doesn't have valid frames.")
+        
+    return frames, total_frames
