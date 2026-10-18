@@ -65,34 +65,29 @@ if __name__ == "__main__":
     metrics.print_table([(n, results[n]) for n in sorted(results)]
                         + [("DEV", metrics.sum_counts(dev)), ("TEST", metrics.sum_counts(test))])
 
+def pixel_difference(f1: np.ndarray, f2: np.ndarray) -> float:
+    """
+    Calcula a media das diferenças absolutas dos niveis de cinzento entre duas frames
+    """
+    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return float(np.mean(np.abs(g1 - g2)))
 
-#Reads video frame by frame and downsclaes it. Returns list of frames and total frames.
-def load_and_preprocess_frames(
-    video_path: str, 
-    target_size: Optional[Tuple[int, int]] = (320, 180)) -> Tuple[List[np.ndarray], int]:
-  
-    cap = cv2.VideoCapture(video_path)
+def histogram_distance(h1: np.ndarray, h2: np.ndarray) -> float:
+    """Calcula a distancia (x^2) entre dois histogramas"""
+    # Garante float32/float64 e achatamento
+    h1 = h1.astype(np.float32).ravel()
+    h2 = h2.astype(np.float32).ravel()
     
-    if not cap.isOpened():
-        raise FileNotFoundError(f"Error on path to video {video_path}")
-        
-    frames = []
+    # Normalizacao (soma = 1)
+    s1, s2 = np.sum(h1), np.sum(h2)
+    if s1 > 0: h1 /= s1
+    if s2 > 0: h2 /= s2
     
-    while True:
-        ret, frame = cap.read()
-        if not ret:
-            break
-            
-        # Redimensiona a frame para (320, 180) se especificado
-        if target_size is not None:
-            frame = cv2.resize(frame, target_size, interpolation=cv2.INTER_AREA)
-            
-        frames.append(frame)
-        
-    cap.release()
+    denom = h1 + h2
+    mask = denom > 0
     
-    total_frames = len(frames)
-    if total_frames == 0:
-        raise ValueError(f"Video {video_path} doesn't have valid frames.")
-        
-    return frames, total_frames
+    x2 = 0.5 * np.sum(((h1[mask] - h2[mask]) ** 2) / denom[mask])
+    return float(x2)
+
+#edge_change_ratio
