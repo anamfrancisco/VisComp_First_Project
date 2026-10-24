@@ -90,4 +90,79 @@ def histogram_distance(h1: np.ndarray, h2: np.ndarray) -> float:
     x2 = 0.5 * np.sum(((h1[mask] - h2[mask]) ** 2) / denom[mask])
     return float(x2)
 
-#edge_change_ratio
+def edge_change_ratio(f1: np.ndarray, f2: np.ndarray, low_thresh: int = 100, high_thresh: int = 200, kernel_size: int = 5) -> float:
+    """
+    Calcula o Edge Change Ratio (ECR) entre duas frames consecutivas f1 (t-1) e f2 (t)
+    """
+    # 1. Converter para niveis de cinzento e detetar contornos com Canny (Cria mapas binarios)
+    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+    
+    e1 = cv2.Canny(g1, low_thresh, high_thresh) > 0
+    e2 = cv2.Canny(g2, low_thresh, high_thresh) > 0
+    
+    # Contagem total de pixels de contorno em cada frame (|E_t-1| e |E_t|)
+    num_e1 = np.sum(e1)
+    num_e2 = np.sum(e2)
+    
+    # 2. Dilatar os mapas de contorno com um kernel (ex: 5x5)
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    d1 = cv2.dilate(e1.astype(np.uint8), kernel) > 0
+    d2 = cv2.dilate(e2.astype(np.uint8), kernel) > 0
+    
+    # 3. Calcular pixels que entram (X_in) e pixels que saem (X_out)
+    x_in = np.sum(e2 & ~d1)   # Contornos de f2 que nao caem na dilatada de f1
+    x_out = np.sum(e1 & ~d2)  # Contornos de f1 que nao caem na dilatada de f2
+    
+    # 4. Normalizacao e tratamento de divisao por zero (ex: frames completamente pretas)
+    r_in = (x_in / num_e2) if num_e2 > 0 else 0.0
+    r_out = (x_out / num_e1) if num_e1 > 0 else 0.0
+    
+    return float(max(r_in, r_out))
+
+import cv2
+import numpy as np
+
+def compute_pixel_diff_signal(frames: list) -> np.ndarray:
+    """Calcula o sinal d(t) para Pixel Difference."""
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+    
+    for t in range(1, n_frames):
+        d[t] = pixel_difference(frames[t-1], frames[t])
+        
+    return d
+
+
+def compute_histogram_signal(frames: list, bins: tuple = (16, 16)) -> np.ndarray:
+    """
+    Calcula o sinal d(t) para Histogram Distance usando o espaco de cor HSV (H e S).
+    Pre-calcula os histogramas para otimizar o tempo de execucao.
+    """
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+    
+    # 1. Pre-calcular o histograma de cada frame em HSV (canais H e S)
+    hists = []
+    for f in frames:
+        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+        # Usa os canais 0 (Hue) e 1 (Saturation)
+        hist = cv2.calcHist([hsv], [0, 1], None, bins, [0, 180, 0, 256])
+        hists.append(hist)
+        
+    # 2. Calcular a distancia entre frames consecutivas
+    for t in range(1, n_frames):
+        d[t] = histogram_distance(hists[t-1], hists[t])
+        
+    return d
+
+
+def compute_ecr_signal(frames: list) -> np.ndarray:
+    """Calcula o sinal d(t) para Edge Change Ratio (ECR)."""
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+    
+    for t in range(1, n_frames):
+        d[t] = edge_change_ratio(frames[t-1], frames[t])
+        
+    return d
