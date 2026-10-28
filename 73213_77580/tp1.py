@@ -13,13 +13,19 @@ import os
 
 import cv2
 import numpy as np
-from typing import List, Tuple, Optional
 
 import grouping   # group_shots: union-find grouping of shots (Part 3, Task 7)
 import metrics
 
 INPUT_DIR = os.path.join("..", "input")
 OUTPUT_DIR = os.path.join("..", "output")
+
+# Parametros do detetor de cortes (escolhidos no DEV, ver report.ipynb)
+CUT_SIGNAL = "histogram"     # sinal principal: "pixel", "histogram" ou "ecr"
+CUT_THRESHOLD = 0.0400
+CONFIRM_SIGNAL = "pixel"     # sinal de confirmacao (None para usar so o principal)
+CONFIRM_THRESHOLD = 33.3024
+MIN_GAP = 5                  # janela (+-frames) para ficar so com o maximo local
 
 
 def read_frames(path, size=(320, 180)):
@@ -35,14 +41,181 @@ def read_frames(path, size=(320, 180)):
     return frames
 
 
+###############################################################################
+## Parte 1 - Funcoes de dissimilaridade
+###############################################################################
+
+def pixel_difference(f1: np.ndarray, f2: np.ndarray) -> float:
+    """
+    Calcula a media das diferenças absolutas dos niveis de cinzento entre duas frames
+    """
+    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY).astype(np.float32)
+    return float(np.mean(np.abs(g1 - g2)))
+
+
+def histogram_distance(h1: np.ndarray, h2: np.ndarray) -> float:
+    """Calcula a distancia (x^2) entre dois histogramas (resultado entre 0 e 1)"""
+    # Garante float32/float64 e achatamento
+    h1 = h1.astype(np.float32).ravel()
+    h2 = h2.astype(np.float32).ravel()
+
+    # Normalizacao (soma = 1)
+    s1, s2 = np.sum(h1), np.sum(h2)
+    if s1 > 0: h1 /= s1
+    if s2 > 0: h2 /= s2
+
+    denom = h1 + h2
+    mask = denom > 0
+
+    x2 = 0.5 * np.sum(((h1[mask] - h2[mask]) ** 2) / denom[mask])
+    return float(x2)
+
+
+def compute_edges(frame: np.ndarray, low_thresh: int = 100, high_thresh: int = 200, kernel_size: int = 5):
+    """Mapa de contornos (Canny) de uma frame e a sua versao dilatada"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    edges = cv2.Canny(gray, low_thresh, high_thresh) > 0
+    kernel = np.ones((kernel_size, kernel_size), np.uint8)
+    dilated = cv2.dilate(edges.astype(np.uint8), kernel) > 0
+    return edges, dilated
+
+
+def ecr_from_edges(e1, d1, e2, d2) -> float:
+    """ECR a partir dos contornos (e) e contornos dilatados (d) de t-1 (1) e t (2)"""
+    num_e1 = np.sum(e1)
+    num_e2 = np.sum(e2)
+
+    x_in = np.sum(e2 & ~d1)   # Contornos de f2 que nao caem na dilatada de f1
+    x_out = np.sum(e1 & ~d2)  # Contornos de f1 que nao caem na dilatada de f2
+
+    # Tratamento de divisao por zero (ex: frames completamente pretas)
+    r_in = (x_in / num_e2) if num_e2 > 0 else 0.0
+    r_out = (x_out / num_e1) if num_e1 > 0 else 0.0
+
+    return float(max(r_in, r_out))
+
+
+def edge_change_ratio(f1: np.ndarray, f2: np.ndarray, low_thresh: int = 100, high_thresh: int = 200, kernel_size: int = 5) -> float:
+    """
+    Calcula o Edge Change Ratio (ECR) entre duas frames consecutivas f1 (t-1) e f2 (t)
+    """
+    e1, d1 = compute_edges(f1, low_thresh, high_thresh, kernel_size)
+    e2, d2 = compute_edges(f2, low_thresh, high_thresh, kernel_size)
+    return ecr_from_edges(e1, d1, e2, d2)
+
+
+###############################################################################
+## Parte 1 - Sinais d(t), com d(0) = 0
+###############################################################################
+
+def compute_pixel_diff_signal(frames: list) -> np.ndarray:
+    """Calcula o sinal d(t) para Pixel Difference."""
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+
+    for t in range(1, n_frames):
+        d[t] = pixel_difference(frames[t-1], frames[t])
+
+    return d
+
+
+def compute_histogram_signal(frames: list, bins: tuple = (8, 8, 8), space: str = "rgb") -> np.ndarray:
+    """
+    Calcula o sinal d(t) para Histogram Distance.
+    space="hsv": histograma 2D dos canais H e S; space="rgb": histograma 3D dos canais B, G e R.
+    Pre-calcula os histogramas para otimizar o tempo de execucao.
+    """
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+
+    # 1. Pre-calcular o histograma de cada frame
+    hists = []
+    for f in frames:
+        if space == "hsv":
+            hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
+            # Usa os canais 0 (Hue) e 1 (Saturation)
+            hist = cv2.calcHist([hsv], [0, 1], None, list(bins), [0, 180, 0, 256])
+        else:
+            hist = cv2.calcHist([f], [0, 1, 2], None, list(bins), [0, 256, 0, 256, 0, 256])
+        hists.append(hist)
+
+    # 2. Calcular a distancia entre frames consecutivas
+    for t in range(1, n_frames):
+        d[t] = histogram_distance(hists[t-1], hists[t])
+
+    return d
+
+
+def compute_ecr_signal(frames: list, kernel_size: int = 5) -> np.ndarray:
+    """
+    Calcula o sinal d(t) para Edge Change Ratio (ECR).
+    Os contornos de cada frame sao calculados uma so vez (cada frame entra em dois pares).
+    """
+    n_frames = len(frames)
+    d = np.zeros(n_frames, dtype=np.float32)
+
+    edges = [compute_edges(f, kernel_size=kernel_size) for f in frames]
+    for t in range(1, n_frames):
+        e1, d1 = edges[t-1]
+        e2, d2 = edges[t]
+        d[t] = ecr_from_edges(e1, d1, e2, d2)
+
+    return d
+
+
+def compute_signal(frames: list, name: str) -> np.ndarray:
+    """Calcula um dos tres sinais pelo nome ("pixel", "histogram" ou "ecr")."""
+    if name == "pixel":
+        return compute_pixel_diff_signal(frames)
+    if name == "histogram":
+        return compute_histogram_signal(frames)
+    if name == "ecr":
+        return compute_ecr_signal(frames)
+    raise ValueError(f"sinal desconhecido: {name}")
+
+
+###############################################################################
+## Parte 1 - Do sinal aos cortes
+###############################################################################
+
+def detect_cuts(signal: np.ndarray, threshold: float, min_gap: int = MIN_GAP) -> list:
+    """
+    Frames acima do limiar que sao maximo local numa janela de +-min_gap frames.
+    Se 2 frames seguidas passarem o limiar no mesmo corte, so a maior conta
+    (uma previsao repetida contaria como falso positivo no match_cuts).
+    """
+    cuts = []
+    for t in np.where(signal > threshold)[0]:
+        lo, hi = max(0, t - min_gap), min(len(signal), t + min_gap + 1)
+        if signal[t] == signal[lo:hi].max():
+            cuts.append(int(t))
+    return cuts
+
+
+def detect_cuts_combined(signal: np.ndarray, threshold: float,
+                         confirm: np.ndarray, confirm_threshold: float, min_gap: int = MIN_GAP) -> list:
+    """Cortes do sinal principal que sao confirmados pelo segundo sinal (tambem acima do seu limiar)"""
+    return [t for t in detect_cuts(signal, threshold, min_gap) if confirm[t] > confirm_threshold]
+
+
 def process_video(frames, gt_shots):
     """Return (transitions, scenes) for one video.
 
     transitions: list of {"type": "cut", "start": t, "end": t}, t = first frame of the new shot (Parts 1 and 2)
     scenes:      dict {str(shot id): label} for the ground-truth shots (Part 3)
     """
-    transitions, scenes = [], {}
-    # TODO: Parts 1, 2 and 3. Everything else (writing the output, evaluation, summary table) is done for you.
+    # Partes 1 e 2: cortes
+    signal = compute_signal(frames, CUT_SIGNAL)
+    if CONFIRM_SIGNAL is None:
+        cuts = detect_cuts(signal, CUT_THRESHOLD)
+    else:
+        confirm = compute_signal(frames, CONFIRM_SIGNAL)
+        cuts = detect_cuts_combined(signal, CUT_THRESHOLD, confirm, CONFIRM_THRESHOLD)
+    transitions = [{"type": "cut", "start": t, "end": t} for t in cuts]
+
+    # Parte 3: TODO (por agora cada shot e uma cena)
+    scenes = {}
     return transitions, scenes
 
 
@@ -64,105 +237,3 @@ if __name__ == "__main__":
     test = [results[n] for n in sorted(results) if n.startswith("test")]
     metrics.print_table([(n, results[n]) for n in sorted(results)]
                         + [("DEV", metrics.sum_counts(dev)), ("TEST", metrics.sum_counts(test))])
-
-def pixel_difference(f1: np.ndarray, f2: np.ndarray) -> float:
-    """
-    Calcula a media das diferenças absolutas dos niveis de cinzento entre duas frames
-    """
-    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY).astype(np.float32)
-    return float(np.mean(np.abs(g1 - g2)))
-
-def histogram_distance(h1: np.ndarray, h2: np.ndarray) -> float:
-    """Calcula a distancia (x^2) entre dois histogramas"""
-    # Garante float32/float64 e achatamento
-    h1 = h1.astype(np.float32).ravel()
-    h2 = h2.astype(np.float32).ravel()
-    
-    # Normalizacao (soma = 1)
-    s1, s2 = np.sum(h1), np.sum(h2)
-    if s1 > 0: h1 /= s1
-    if s2 > 0: h2 /= s2
-    
-    denom = h1 + h2
-    mask = denom > 0
-    
-    x2 = 0.5 * np.sum(((h1[mask] - h2[mask]) ** 2) / denom[mask])
-    return float(x2)
-
-def edge_change_ratio(f1: np.ndarray, f2: np.ndarray, low_thresh: int = 100, high_thresh: int = 200, kernel_size: int = 5) -> float:
-    """
-    Calcula o Edge Change Ratio (ECR) entre duas frames consecutivas f1 (t-1) e f2 (t)
-    """
-    # 1. Converter para niveis de cinzento e detetar contornos com Canny (Cria mapas binarios)
-    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
-    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
-    
-    e1 = cv2.Canny(g1, low_thresh, high_thresh) > 0
-    e2 = cv2.Canny(g2, low_thresh, high_thresh) > 0
-    
-    # Contagem total de pixels de contorno em cada frame (|E_t-1| e |E_t|)
-    num_e1 = np.sum(e1)
-    num_e2 = np.sum(e2)
-    
-    # 2. Dilatar os mapas de contorno com um kernel (ex: 5x5)
-    kernel = np.ones((kernel_size, kernel_size), np.uint8)
-    d1 = cv2.dilate(e1.astype(np.uint8), kernel) > 0
-    d2 = cv2.dilate(e2.astype(np.uint8), kernel) > 0
-    
-    # 3. Calcular pixels que entram (X_in) e pixels que saem (X_out)
-    x_in = np.sum(e2 & ~d1)   # Contornos de f2 que nao caem na dilatada de f1
-    x_out = np.sum(e1 & ~d2)  # Contornos de f1 que nao caem na dilatada de f2
-    
-    # 4. Normalizacao e tratamento de divisao por zero (ex: frames completamente pretas)
-    r_in = (x_in / num_e2) if num_e2 > 0 else 0.0
-    r_out = (x_out / num_e1) if num_e1 > 0 else 0.0
-    
-    return float(max(r_in, r_out))
-
-import cv2
-import numpy as np
-
-def compute_pixel_diff_signal(frames: list) -> np.ndarray:
-    """Calcula o sinal d(t) para Pixel Difference."""
-    n_frames = len(frames)
-    d = np.zeros(n_frames, dtype=np.float32)
-    
-    for t in range(1, n_frames):
-        d[t] = pixel_difference(frames[t-1], frames[t])
-        
-    return d
-
-
-def compute_histogram_signal(frames: list, bins: tuple = (16, 16)) -> np.ndarray:
-    """
-    Calcula o sinal d(t) para Histogram Distance usando o espaco de cor HSV (H e S).
-    Pre-calcula os histogramas para otimizar o tempo de execucao.
-    """
-    n_frames = len(frames)
-    d = np.zeros(n_frames, dtype=np.float32)
-    
-    # 1. Pre-calcular o histograma de cada frame em HSV (canais H e S)
-    hists = []
-    for f in frames:
-        hsv = cv2.cvtColor(f, cv2.COLOR_BGR2HSV)
-        # Usa os canais 0 (Hue) e 1 (Saturation)
-        hist = cv2.calcHist([hsv], [0, 1], None, bins, [0, 180, 0, 256])
-        hists.append(hist)
-        
-    # 2. Calcular a distancia entre frames consecutivas
-    for t in range(1, n_frames):
-        d[t] = histogram_distance(hists[t-1], hists[t])
-        
-    return d
-
-
-def compute_ecr_signal(frames: list) -> np.ndarray:
-    """Calcula o sinal d(t) para Edge Change Ratio (ECR)."""
-    n_frames = len(frames)
-    d = np.zeros(n_frames, dtype=np.float32)
-    
-    for t in range(1, n_frames):
-        d[t] = edge_change_ratio(frames[t-1], frames[t])
-        
-    return d
