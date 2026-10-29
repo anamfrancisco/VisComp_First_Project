@@ -27,6 +27,13 @@ CONFIRM_SIGNAL = "pixel"     # sinal de confirmacao (None para usar so o princip
 CONFIRM_THRESHOLD = 33.3024
 MIN_GAP = 5                  # janela (+-frames) para ficar so com o maximo local
 
+# Parametros da verificacao com SIFT (Parte 2, escolhidos no DEV, ver report.ipynb)
+VERIFY_CUTS = True           # False para usar so a Parte 1
+GAP = 4                      # compara as frames t-GAP e t+GAP (um flash dura no maximo 3 frames)
+RATIO = 0.7                  # ratio test de Lowe (como no lab 3)
+USE_RANSAC = False           # True para contar so os inliers da homografia (deu o mesmo F1)
+MIN_MATCHES = 31             # com pelo menos MIN_MATCHES matches e a mesma cena -> rejeita o corte
+
 
 def read_frames(path, size=(320, 180)):
     """Read every frame of a video, resized to `size`. Returns a list of BGR images."""
@@ -199,6 +206,80 @@ def detect_cuts_combined(signal: np.ndarray, threshold: float,
     return [t for t in detect_cuts(signal, threshold, min_gap) if confirm[t] > confirm_threshold]
 
 
+###############################################################################
+## Parte 2 - Verificacao dos cortes candidatos com SIFT
+## (baseado no match_images_FLANN e no filter_matches_RANSAC do lab3_match.py)
+###############################################################################
+
+sift = cv2.SIFT_create()
+bf = cv2.BFMatcher(cv2.NORM_L2)    # NORM_L2 porque os descritores SIFT sao vetores reais
+
+
+def sift_matches(f1: np.ndarray, f2: np.ndarray, ratio: float = RATIO):
+    """
+    Keypoints SIFT das duas frames e os matches que passam o ratio test de Lowe.
+    Devolve (kp1, kp2, good_matches).
+    """
+    g1 = cv2.cvtColor(f1, cv2.COLOR_BGR2GRAY)
+    g2 = cv2.cvtColor(f2, cv2.COLOR_BGR2GRAY)
+    kp1, des1 = sift.detectAndCompute(g1, None)
+    kp2, des2 = sift.detectAndCompute(g2, None)
+
+    # frames sem keypoints (ex: frame quase uniforme) -> nao ha matches
+    if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
+        return kp1, kp2, []
+
+    # para cada keypoint de f1, os 2 vizinhos mais proximos em f2
+    raw_matches = bf.knnMatch(des1, des2, k=2)
+    good_matches = []
+    for pair in raw_matches:
+        # so aceita se o melhor for claramente melhor que o segundo
+        if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance:
+            good_matches.append(pair[0])
+    return kp1, kp2, good_matches
+
+
+def ransac_inliers(kp1, kp2, matches, threshold: float = 5.0) -> list:
+    """Matches que concordam com uma homografia (RANSAC). Com menos de 4 matches nao da para calcular."""
+    if len(matches) < 4:
+        return []
+    src_pts = np.float32([kp1[m.queryIdx].pt for m in matches]).reshape(-1, 1, 2)
+    dst_pts = np.float32([kp2[m.trainIdx].pt for m in matches]).reshape(-1, 1, 2)
+    cv2.setRNGSeed(0)    # o RANSAC e aleatorio: fixar a semente para os resultados serem sempre iguais
+    H, mask = cv2.findHomography(src_pts, dst_pts, cv2.RANSAC, threshold)
+    if H is None:
+        return []
+    return [m for m, keep in zip(matches, mask.ravel()) if keep]
+
+
+def count_matches(f1: np.ndarray, f2: np.ndarray, use_ransac: bool = USE_RANSAC) -> int:
+    """Numero de matches entre duas frames (inliers do RANSAC se use_ransac=True)"""
+    kp1, kp2, good = sift_matches(f1, f2)
+    if use_ransac:
+        return len(ransac_inliers(kp1, kp2, good))
+    return len(good)
+
+
+def candidate_matches(frames: list, cuts: list, gap: int = GAP, use_ransac: bool = USE_RANSAC) -> list:
+    """Para cada corte candidato t, numero de matches entre as frames t-gap e t+gap"""
+    counts = []
+    for t in cuts:
+        before = max(0, t - gap)
+        after = min(len(frames) - 1, t + gap)
+        counts.append(count_matches(frames[before], frames[after], use_ransac))
+    return counts
+
+
+def verify_cuts(frames: list, cuts: list, min_matches: int = MIN_MATCHES,
+                gap: int = GAP, use_ransac: bool = USE_RANSAC) -> list:
+    """
+    Fica so com os cortes em que as frames antes e depois NAO se parecem.
+    Muitos matches -> mesmo conteudo (flash, movimento...) -> falso alarme.
+    """
+    counts = candidate_matches(frames, cuts, gap, use_ransac)
+    return [t for t, n in zip(cuts, counts) if n < min_matches]
+
+
 def process_video(frames, gt_shots):
     """Return (transitions, scenes) for one video.
 
@@ -212,6 +293,10 @@ def process_video(frames, gt_shots):
     else:
         confirm = compute_signal(frames, CONFIRM_SIGNAL)
         cuts = detect_cuts_combined(signal, CUT_THRESHOLD, confirm, CONFIRM_THRESHOLD)
+
+    # Parte 2: verificacao dos candidatos com SIFT
+    if VERIFY_CUTS:
+        cuts = verify_cuts(frames, cuts)
     transitions = [{"type": "cut", "start": t, "end": t} for t in cuts]
 
     # Parte 3: TODO (por agora cada shot e uma cena)
