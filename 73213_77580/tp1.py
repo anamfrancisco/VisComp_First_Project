@@ -109,7 +109,8 @@ def ecr_from_edges(e1, d1, e2, d2) -> float:
     return float(max(r_in, r_out))
 
 
-def edge_change_ratio(f1: np.ndarray, f2: np.ndarray, low_thresh: int = 100, high_thresh: int = 200, kernel_size: int = 5) -> float:
+def edge_change_ratio(f1: np.ndarray, f2: np.ndarray, low_thresh: int = 100, high_thresh: int = 200,
+                      kernel_size: int = 5) -> float:
     """
     Calcula o Edge Change Ratio (ECR) entre duas frames consecutivas f1 (t-1) e f2 (t)
     """
