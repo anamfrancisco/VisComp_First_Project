@@ -38,6 +38,7 @@ MIN_MATCHES = 31             # com pelo menos MIN_MATCHES matches e a mesma cena
 # TODO: escolher no DEV depois da Task 6
 N_KEYFRAMES = 5              # numero de keyframes por shot na estrategia "multi"
 KEYFRAME_MARGIN = 0.1        # ignora 10% do inicio e do fim do shot
+SCENE_SIFT_FEATURES = 300    # maximo de keypoints SIFT por keyframe (os mais fortes), para poupar tempo
 
 
 def read_frames(path, size=(320, 180)):
@@ -230,18 +231,23 @@ def sift_matches(f1: np.ndarray, f2: np.ndarray, ratio: float = RATIO):
     kp1, des1 = sift.detectAndCompute(g1, None)
     kp2, des2 = sift.detectAndCompute(g2, None)
 
-    # frames sem keypoints (ex: frame quase uniforme) -> nao ha matches
-    if des1 is None or des2 is None or len(kp1) < 2 or len(kp2) < 2:
-        return kp1, kp2, []
+    return kp1, kp2, ratio_test(des1, des2, ratio)
 
-    # para cada keypoint de f1, os 2 vizinhos mais proximos em f2
+
+def ratio_test(des1, des2, ratio: float = RATIO) -> list:
+    """Matches entre dois conjuntos de descritores SIFT que passam o ratio test de Lowe"""
+    # frames sem keypoints (ex: frame quase uniforme) -> nao ha matches
+    if des1 is None or des2 is None or len(des1) < 2 or len(des2) < 2:
+        return []
+
+    # para cada descritor de des1, os 2 vizinhos mais proximos em des2
     raw_matches = bf.knnMatch(des1, des2, k=2)
     good_matches = []
     for pair in raw_matches:
         # so aceita se o melhor for claramente melhor que o segundo
         if len(pair) == 2 and pair[0].distance < ratio * pair[1].distance:
             good_matches.append(pair[0])
-    return kp1, kp2, good_matches
+    return good_matches
 
 
 def ransac_inliers(kp1, kp2, matches, threshold: float = 5.0) -> list:
@@ -338,6 +344,83 @@ def combine_keyframe_sims(sims: np.ndarray, how: str = "max") -> float:
     if how == "best_mean":
         return float((sims.max(axis=1).mean() + sims.max(axis=0).mean()) / 2)
     raise ValueError(f"combinacao desconhecida: {how}")
+
+
+###############################################################################
+## Parte 3 - Task 6: semelhanca entre shots
+###############################################################################
+
+# nfeatures limita o numero de keypoints aos mais fortes (como no lab 4, SIFT_create(nfeatures=50))
+scene_sift = cv2.SIFT_create(nfeatures=SCENE_SIFT_FEATURES)
+
+
+def keyframe_histogram(frame: np.ndarray) -> np.ndarray:
+    """Histograma RGB 8x8x8 de um keyframe (o mesmo da Parte 1)"""
+    return cv2.calcHist([frame], [0, 1, 2], None, [8, 8, 8], [0, 256, 0, 256, 0, 256])
+
+
+def keyframe_descriptors(frame: np.ndarray):
+    """Descritores SIFT de um keyframe (no maximo SCENE_SIFT_FEATURES)"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    _, des = scene_sift.detectAndCompute(gray, None)
+    return des
+
+
+def keyframe_similarity_matrix(frames: list, keyframe_list: list, kind: str = "color") -> np.ndarray:
+    """
+    Semelhanca entre todos os pares de keyframes de um video (matriz K x K).
+    kind="color": 1 - chi2 entre os histogramas (1 = cores iguais, 0 = nada em comum)
+    kind="sift":  numero de matches SIFT que passam o ratio test
+    As features de cada keyframe sao calculadas uma so vez.
+    """
+    k = len(keyframe_list)
+    if kind == "color":
+        feats = [keyframe_histogram(frames[t]) for t in keyframe_list]
+    else:
+        feats = [keyframe_descriptors(frames[t]) for t in keyframe_list]
+
+    sims = np.zeros((k, k), dtype=np.float32)
+    for i in range(k):
+        for j in range(i + 1, k):
+            if kind == "color":
+                sims[i, j] = 1.0 - histogram_distance(feats[i], feats[j])
+            else:
+                sims[i, j] = len(ratio_test(feats[i], feats[j]))
+            sims[j, i] = sims[i, j]
+    return sims
+
+
+def shot_similarity_matrix(frames: list, keyframes: list, kind: str = "color", how: str = "max",
+                           kf_sims: np.ndarray = None) -> np.ndarray:
+    """
+    Matriz shot x shot: para cada par de shots junta as semelhancas dos seus keyframes
+    com combine_keyframe_sims (Task 5). keyframes[i] = lista de keyframes do shot i.
+    kf_sims pode ser passada para nao recalcular a matriz dos keyframes.
+    """
+    # todos os keyframes do video numa so lista (pela ordem dos shots)
+    keyframe_list = []
+    for kfs in keyframes:
+        keyframe_list.extend(kfs)
+    if kf_sims is None:
+        kf_sims = keyframe_similarity_matrix(frames, keyframe_list, kind)
+
+    # os keyframes do shot i ocupam as posicoes first[i] ate first[i+1]-1 de keyframe_list
+    first = [0]
+    for kfs in keyframes:
+        first.append(first[-1] + len(kfs))
+
+    n = len(keyframes)
+    sim = np.zeros((n, n), dtype=np.float32)
+    for a in range(n):
+        for b in range(a + 1, n):
+            block = kf_sims[first[a]:first[a + 1], first[b]:first[b + 1]]
+            sim[a, b] = combine_keyframe_sims(block, how)
+            sim[b, a] = sim[a, b]
+
+    # um shot e sempre igual a si proprio (a diagonal nao e usada no agrupamento)
+    for a in range(n):
+        sim[a, a] = sim.max()
+    return sim
 
 
 def process_video(frames, gt_shots):
