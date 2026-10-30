@@ -34,6 +34,11 @@ RATIO = 0.7                  # ratio test de Lowe (como no lab 3)
 USE_RANSAC = False           # True para contar so os inliers da homografia (deu o mesmo F1)
 MIN_MATCHES = 31             # com pelo menos MIN_MATCHES matches e a mesma cena -> rejeita o corte
 
+# Parametros dos keyframes (Parte 3, Task 5)
+# TODO: escolher no DEV depois da Task 6
+N_KEYFRAMES = 5              # numero de keyframes por shot na estrategia "multi"
+KEYFRAME_MARGIN = 0.1        # ignora 10% do inicio e do fim do shot
+
 
 def read_frames(path, size=(320, 180)):
     """Read every frame of a video, resized to `size`. Returns a list of BGR images."""
@@ -278,6 +283,61 @@ def verify_cuts(frames: list, cuts: list, min_matches: int = MIN_MATCHES,
     """
     counts = candidate_matches(frames, cuts, gap, use_ransac)
     return [t for t, n in zip(cuts, counts) if n < min_matches]
+
+
+###############################################################################
+## Parte 3 - Task 5: representar cada shot por keyframes
+###############################################################################
+
+def middle_keyframe(shot: dict) -> list:
+    """Estrategia 1: um so keyframe, a frame do meio do shot"""
+    return [(shot["start"] + shot["end"]) // 2]
+
+
+def sample_keyframes(shot: dict, n: int = N_KEYFRAMES, margin: float = KEYFRAME_MARGIN) -> list:
+    """
+    Estrategia 2: n keyframes espalhados de forma uniforme pelo shot.
+    Ignora uma margem no inicio e no fim (frames perto do corte podem ter desfocado de movimento).
+    Em shots curtos podem sair menos de n keyframes (nao se repetem frames).
+    """
+    start, end = shot["start"], shot["end"]     # end e a ultima frame do shot (inclusive)
+    length = end - start + 1
+    lo = start + int(margin * length)
+    hi = end - int(margin * length)
+    if n == 1 or hi <= lo:
+        return middle_keyframe(shot)
+
+    keyframes = []
+    for t in np.linspace(lo, hi, n):
+        t = int(round(t))
+        if t not in keyframes:
+            keyframes.append(t)
+    return keyframes
+
+
+def shot_keyframes(gt_shots: list, mode: str = "multi", n: int = N_KEYFRAMES) -> list:
+    """Lista com os keyframes (indices de frames) de cada shot, pela ordem de gt_shots"""
+    if mode == "middle":
+        return [middle_keyframe(shot) for shot in gt_shots]
+    return [sample_keyframes(shot, n) for shot in gt_shots]
+
+
+def combine_keyframe_sims(sims: np.ndarray, how: str = "max") -> float:
+    """
+    Junta as semelhancas entre os keyframes de dois shots num so numero.
+    sims[i][j] = semelhanca entre o keyframe i do shot A e o keyframe j do shot B (Task 6).
+      "max":  o melhor par de keyframes
+      "mean": a media de todos os pares
+      "best_mean": para cada keyframe, o seu melhor par no outro shot; media nos dois sentidos
+    """
+    sims = np.asarray(sims, dtype=np.float32)
+    if how == "max":
+        return float(sims.max())
+    if how == "mean":
+        return float(sims.mean())
+    if how == "best_mean":
+        return float((sims.max(axis=1).mean() + sims.max(axis=0).mean()) / 2)
+    raise ValueError(f"combinacao desconhecida: {how}")
 
 
 def process_video(frames, gt_shots):
