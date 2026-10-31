@@ -34,11 +34,16 @@ RATIO = 0.7                  # ratio test de Lowe (como no lab 3)
 USE_RANSAC = False           # True para contar so os inliers da homografia (deu o mesmo F1)
 MIN_MATCHES = 31             # com pelo menos MIN_MATCHES matches e a mesma cena -> rejeita o corte
 
-# Parametros dos keyframes (Parte 3, Task 5)
-# TODO: escolher no DEV depois da Task 6
+# Parametros das cenas (Parte 3, Tasks 5 a 7)
 N_KEYFRAMES = 5              # numero de keyframes por shot na estrategia "multi"
 KEYFRAME_MARGIN = 0.1        # ignora 10% do inicio e do fim do shot
 SCENE_SIFT_FEATURES = 300    # maximo de keypoints SIFT por keyframe (os mais fortes), para poupar tempo
+
+# Metodo escolhido no DEV (ver report.ipynb, Task 7)
+SCENE_KIND = "sift"          # "color" ou "sift"
+SCENE_KEYFRAMES = "multi"    # "middle" (1 keyframe) ou "multi" (N_KEYFRAMES)
+SCENE_HOW = "max"            # como juntar os keyframes: "max", "mean" ou "best_mean"
+SCENE_THRESHOLD = 38         # dois shots ficam ligados se tiverem pelo menos 38 matches SIFT
 
 
 def read_frames(path, size=(320, 180)):
@@ -443,8 +448,11 @@ def process_video(frames, gt_shots):
         cuts = verify_cuts(frames, cuts)
     transitions = [{"type": "cut", "start": t, "end": t} for t in cuts]
 
-    # Parte 3: TODO (por agora cada shot e uma cena)
-    scenes = {}
+    # Parte 3: agrupar os shots do ground truth em cenas
+    keyframes = shot_keyframes(gt_shots, SCENE_KEYFRAMES)
+    sim = shot_similarity_matrix(frames, keyframes, SCENE_KIND, SCENE_HOW)
+    labels = grouping.group_shots(sim, SCENE_THRESHOLD)
+    scenes = {str(s["id"]): label for s, label in zip(gt_shots, labels)}
     return transitions, scenes
 
 
